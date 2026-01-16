@@ -1,0 +1,197 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Darsh Entertainments</title>
+    
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/hands/hands.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/camera_utils/camera_utils.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+
+    <style>
+        body { margin: 0; overflow: hidden; background: #000; font-family: 'Inter', sans-serif; }
+        #input_video { position: fixed; width: 100vw; height: 100vh; object-fit: cover; transform: scaleX(-1); }
+        #output_canvas { position: fixed; top: 0; left: 0; width: 100vw; height: 100vh; z-index: 10; }
+
+        #ui {
+            position: fixed;
+            top: 25px;
+            left: 25px;
+            background: rgba(0, 15, 35, 0.85);
+            backdrop-filter: blur(15px);
+            padding: 22px;
+            border-radius: 12px;
+            border: 1px solid rgba(0, 229, 255, 0.5);
+            color: white;
+            z-index: 100;
+            box-shadow: 0 10px 40px rgba(0,0,0,0.6);
+        }
+
+        h3 { margin: 0 0 15px 0; color: #00e5ff; font-size: 14px; letter-spacing: 2px; text-transform: uppercase; }
+        .hint { display: flex; align-items: center; margin: 12px 0; font-size: 13px; }
+        .tag { padding: 4px 10px; border-radius: 4px; margin-right: 12px; font-weight: 800; min-width: 100px; text-align: center; font-size: 10px; }
+        .tag.spawn { background: #00ff88; color: #003311; }
+        .tag.drag { background: #ffcc00; color: #332200; }
+        .tag.del { background: #ff4444; color: #ffffff; }
+        
+        .grid-status { font-size: 10px; color: #00e5ff; margin-top: 15px; opacity: 0.8; border-top: 1px solid rgba(0,229,255,0.2); padding-top: 10px; }
+    </style>
+</head>
+<body>
+
+    <video id="input_video" playsinline></video>
+    <canvas id="output_canvas"></canvas>
+
+    <div id="ui">
+        <h3>Darsh Entertainments</h3>
+        <div class="hint"><span class="tag spawn">INDEX PINCH</span> Spawn & Snap</div>
+        <div class="hint"><span class="tag drag">MIDDLE PINCH</span> Drag & Snap</div>
+        <div class="hint"><span class="tag del">INDEX POINT</span> Delete Block</div>
+        <div class="grid-status">GRID RESOLUTION: 0.5 UNITS (AUTO-SNAP)</div>
+    </div>
+
+    <script>
+        const video = document.getElementById('input_video');
+        const canvas = document.getElementById('output_canvas');
+
+        // --- 1. CORE ENGINE ---
+        const scene = new THREE.Scene();
+        const camera = new THREE.PerspectiveCamera(75, window.innerWidth / window.innerHeight, 0.1, 1000);
+        const renderer = new THREE.WebGLRenderer({ canvas: canvas, alpha: true, antialias: true });
+        renderer.setSize(window.innerWidth, window.innerHeight);
+        camera.position.z = 5;
+
+        scene.add(new THREE.AmbientLight(0xffffff, 0.8));
+        const light = new THREE.PointLight(0x00e5ff, 1.2);
+        light.position.set(5, 5, 5);
+        scene.add(light);
+
+        const blocks = [];
+        const GRID_SIZE = 0.5; // Matches block size for perfect stacking
+        const blockGeo = new THREE.BoxGeometry(GRID_SIZE, GRID_SIZE, GRID_SIZE);
+        const blockMat = new THREE.MeshPhongMaterial({ 
+            color: 0x0088ff, 
+            transparent: true, 
+            opacity: 0.6, 
+            shininess: 100,
+            emissive: 0x002244 
+        });
+
+        // --- 2. SKELETON SETUP ---
+        const handGroup = new THREE.Group();
+        scene.add(handGroup);
+        const joints = Array.from({ length: 21 }, () => new THREE.Mesh(new THREE.SphereGeometry(0.04), new THREE.MeshBasicMaterial({ color: 0x00e5ff })));
+        joints.forEach(j => handGroup.add(j));
+
+        const connections = [[0,1,2,3,4], [0,5,6,7,8], [0,9,10,11,12], [0,13,14,15,16], [0,17,18,19,20], [5,9,13,17]];
+        const lines = connections.map(() => new THREE.Line(new THREE.BufferGeometry(), new THREE.LineBasicMaterial({ color: 0xffffff, transparent: true, opacity: 0.4 })));
+        lines.forEach(l => handGroup.add(l));
+
+        let lastAction = 0;
+        let grabbedBlock = null;
+
+        // --- 3. THE MATH: SNAPPING & MAPPING ---
+        function snapValue(val) {
+            return Math.round(val / GRID_SIZE) * GRID_SIZE;
+        }
+
+        function getWorldCoords(landmark) {
+            const x = (1 - landmark.x) * 2 - 1;
+            const y = -(landmark.y * 2 - 1);
+            const vector = new THREE.Vector3(x, y, 0.5);
+            vector.unproject(camera);
+            const dir = vector.sub(camera.position).normalize();
+            const distance = -camera.position.z / dir.z;
+            return camera.position.clone().add(dir.multiplyScalar(distance));
+        }
+
+        function onResults(results) {
+            if (!results.multiHandLandmarks || results.multiHandLandmarks.length === 0) {
+                handGroup.visible = false;
+                return;
+            }
+            handGroup.visible = true;
+            const landmarks = results.multiHandLandmarks[0];
+            const worldPoints = landmarks.map(lm => getWorldCoords(lm));
+            
+            // Update Visual Skeleton
+            worldPoints.forEach((pos, i) => joints[i].position.copy(pos));
+            connections.forEach((conn, i) => lines[i].geometry.setFromPoints(conn.map(idx => worldPoints[idx])));
+
+            const thumb = worldPoints[4];
+            const index = worldPoints[8];
+            const middle = worldPoints[12];
+            const palm = worldPoints[0];
+
+            const indexPinch = thumb.distanceTo(index);
+            const middlePinch = thumb.distanceTo(middle);
+            const isPointing = index.distanceTo(palm) > 1.5 && middle.distanceTo(palm) < 0.8;
+
+            // --- GESTURE LOGIC WITH SNAPPING ---
+            if (indexPinch < 0.4 && !isPointing) {
+                updateColors(0x00ff88); // Green
+                if (Date.now() - lastAction > 800) {
+                    const b = new THREE.Mesh(blockGeo, blockMat.clone());
+                    // SNAP ON SPAWN
+                    b.position.set(snapValue(index.x), snapValue(index.y), snapValue(index.z));
+                    scene.add(b);
+                    blocks.push(b);
+                    lastAction = Date.now();
+                }
+            } 
+            else if (middlePinch < 0.4) {
+                updateColors(0xffcc00); // Yellow
+                if (!grabbedBlock) grabbedBlock = blocks.find(b => b.position.distanceTo(middle) < 0.7);
+                if (grabbedBlock) {
+                    // SNAP WHILE DRAGGING
+                    const targetX = snapValue(middle.x);
+                    const targetY = snapValue(middle.y);
+                    grabbedBlock.position.lerp(new THREE.Vector3(targetX, targetY, 0), 0.2);
+                }
+            }
+            else if (isPointing) {
+                updateColors(0xff4444); // Red
+                const targetIdx = blocks.findIndex(b => b.position.distanceTo(index) < 0.6);
+                if (targetIdx !== -1 && Date.now() - lastAction > 400) {
+                    scene.remove(blocks[targetIdx]);
+                    blocks.splice(targetIdx, 1);
+                    lastAction = Date.now();
+                }
+            }
+            else {
+                updateColors(0x00e5ff); // Cyan
+                grabbedBlock = null;
+            }
+        }
+
+        function updateColors(hex) {
+            joints.forEach(j => j.material.color.setHex(hex));
+            lines.forEach(l => l.material.color.setHex(hex));
+        }
+
+        // --- 4. LAUNCH ---
+        const hands = new Hands({ locateFile: (f) => `https://cdn.jsdelivr.net/npm/@mediapipe/hands/${f}` });
+        hands.setOptions({ maxNumHands: 1, modelComplexity: 1, minDetectionConfidence: 0.8 });
+        hands.onResults(onResults);
+
+        const cam = new Camera(video, {
+            onFrame: async () => await hands.send({ image: video }),
+            width: 1280, height: 720
+        });
+        cam.start();
+
+        function animate() {
+            requestAnimationFrame(animate);
+            renderer.render(scene, camera);
+        }
+        animate();
+
+        window.addEventListener('resize', () => {
+            camera.aspect = window.innerWidth / window.innerHeight;
+            camera.updateProjectionMatrix();
+            renderer.setSize(window.innerWidth, window.innerHeight);
+        });
+    </script>
+</body>
+</html>
